@@ -13,6 +13,8 @@ add_executable(${PROJECT_NAME}
     src/getopt.h
     src/http_parser.c
     src/http_parser.h
+    src/stopwatch.c
+    src/stopwatch.h
 )
 
 target_link_libraries(${PROJECT_NAME}
