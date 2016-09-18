@@ -15,6 +15,8 @@ add_executable(${PROJECT_NAME}
     src/http_parser.h
     src/stopwatch.c
     src/stopwatch.h
+    src/uv_ext.c
+    src/uv_ext.h
 )
 
 target_link_libraries(${PROJECT_NAME}
