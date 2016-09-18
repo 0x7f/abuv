@@ -8,6 +8,7 @@
 #include "getopt.h"
 #include "http_parser.h"
 #include "stopwatch.h"
+#include "uv_ext.h"
 
 #ifndef DEFAULT_USER_AGENT
 #define DEFAULT_USER_AGENT "abuv/0.1"
@@ -38,7 +39,10 @@ void run_benchmark();
 void on_resolved(uv_getaddrinfo_t *resolver, int status, struct addrinfo *addr);
 char *extract_url_field(const char *url, struct http_parser_url *u,
                         enum http_parser_url_fields field, char *fallback);
-void prepare_http_request();
+int parse_url(char *url, char **host, char **port, char **path);
+uv_buf_t build_http_request(char *method, char *host, char *path,
+                            char *user_agent, int keep_alive, uv_buf_t headers,
+                            uv_buf_t body);
 
 /* Contexts */
 
@@ -72,14 +76,8 @@ struct thread_ctx_s {
 };
 
 struct global_ctx_s {
-  char *host;
-  char *path;
-  char *port;
-  char *http_req;
-  int http_req_len;
+  uv_buf_t http_req;
   int keep_alive;
-  char *user_agent;
-  char *url;
   uint32_t num_threads;
   uint64_t num_req;
   uint64_t num_req_per_conn;
@@ -117,7 +115,6 @@ void global_ctx_defaults(global_ctx_t *global) {
   global->num_conn = 1;
   global->num_threads = 1;
   global->keep_alive = 1;
-  global->user_agent = DEFAULT_USER_AGENT;
 }
 
 void global_ctx_derived(global_ctx_t *global) {
@@ -206,8 +203,8 @@ void on_connect(uv_connect_t *req, int status) {
 
 int write_http_request(uv_stream_t *handle) {
   conn_ctx_t *cctx = (conn_ctx_t *)handle->data;
-  uv_buf_t buf = {.base = s_global.http_req, .len = s_global.http_req_len};
-  return uv_write(&cctx->write_req, handle, &buf, 1, on_write_end);
+  return uv_write(&cctx->write_req, handle, &s_global.http_req, 1,
+                  on_write_end);
 }
 
 void setup_connection(conn_ctx_t *cctx) {
@@ -303,8 +300,7 @@ int on_message_complete(http_parser *parser) {
 void on_resolved(uv_getaddrinfo_t *resolver, int status,
                  struct addrinfo *addr) {
   if (status < 0) {
-    fprintf(stderr, "Unable to resolve the address \"%s\": %s\n", s_global.host,
-            uv_err_name(status));
+    fprintf(stderr, "Unable to resolve the address: %s\n", uv_err_name(status));
     exit(EXIT_FAILURE);
   }
 
@@ -375,35 +371,45 @@ char *extract_url_field(const char *url, struct http_parser_url *u,
   return res;
 }
 
-int parse_url(char *url) {
+int parse_url(char *url, char **host, char **port, char **path) {
   struct http_parser_url parser;
   http_parser_url_init(&parser);
   int rc = http_parser_parse_url(url, strlen(url), 0, &parser);
   if (rc == 0) {
-    s_global.host = extract_url_field(url, &parser, UF_HOST, NULL);
-    s_global.port = extract_url_field(url, &parser, UF_PORT, "80");
-    s_global.path = extract_url_field(url, &parser, UF_PATH, "/");
+    *host = extract_url_field(url, &parser, UF_HOST, NULL);
+    *port = extract_url_field(url, &parser, UF_PORT, "80");
+    *path = extract_url_field(url, &parser, UF_PATH, "/");
   }
   return rc;
 }
 
-void prepare_http_request() {
-  // TODO: allow specifying custom header
-  char *HTTP_REQ_FMT = "GET %s HTTP/1.1\r\n"
-                       "Host: %s\r\n"
-                       "User-Agent: %s\r\n"
-                       "Connection: %s\r\n"
-                       "\r\n";
+uv_buf_t build_http_request(char *method, char *host, char *path,
+                            char *user_agent, int keep_alive, uv_buf_t headers,
+                            uv_buf_t body) {
+  uv_buf_t http_req = uv_buf_new();
+  uv_buf_xcat(&http_req, "%s %s HTTP/1.1\r\n", method, path);
+  uv_buf_xcat(&http_req, "User-Agent: %s\r\n", user_agent);
+  char *connection = keep_alive ? "keep-alive" : "close";
+  uv_buf_xcat(&http_req, "Connection: %s\r\n", connection);
+  if (body.len) {
+    uv_buf_xcat(&http_req, "Content-Length: %d\r\n", body.len);
+  }
+  uv_buf_ncat(&http_req, headers.base, headers.len);
+  uv_buf_cat(&http_req, "\r\n");
+  if (body.len) {
+    uv_buf_ncat(&http_req, body.base, body.len);
+  }
 
-  char *keep_alive_str = s_global.keep_alive ? "keep-alive" : "close";
-  size_t req_buf_len = strlen(HTTP_REQ_FMT) + strlen(s_global.path) +
-                       strlen(s_global.host) + strlen(s_global.user_agent) +
-                       strlen(keep_alive_str) - (4 * strlen("%s")) + 1;
-  s_global.http_req = (char *)malloc(req_buf_len);
-  snprintf(s_global.http_req, req_buf_len, HTTP_REQ_FMT, s_global.path,
-           s_global.host, s_global.user_agent, keep_alive_str);
-  s_global.http_req_len = strlen(s_global.http_req);
+  return http_req;
 }
+
+void print_opt(FILE *f, char c, char *arg, char *desc) {
+  fprintf(f, "    %c%c %-12s %s\n", c ? '-' : ' ', c ? c : ' ', arg, desc);
+}
+
+void print_flag(FILE *f, char c, char *desc) { print_opt(f, c, "", desc); }
+
+void print_add_line(FILE *f, char *desc) { print_opt(f, 0, "", desc); }
 
 void print_help(FILE *f, int argc, char **argv, char *err) {
   if (err) {
@@ -411,12 +417,25 @@ void print_help(FILE *f, int argc, char **argv, char *err) {
   }
   fprintf(f, "Usage: %s [options] http://hostname[:port][/path]\n", argv[0]);
   fprintf(f, "Options are:\n");
-  fprintf(f, "    -n requests     Number of requests to perform\n");
-  fprintf(f, "    -c concurrency  Number of multiple requests to make\n");
-  fprintf(f, "    -t threads      Number of worker threads to spawn\n");
-  fprintf(f, "    -k              Use HTTP KeepAlive feature (default)\n");
-  fprintf(f, "    -K              Disable HTTP KeepAlive feature\n");
-  fprintf(f, "    -h              Display usage information(this message)\n");
+  print_opt(f, 'n', "requests", "Number of requests to perform");
+  print_opt(f, 'c', "concurrency", "Number of multiple requests to make");
+  print_opt(f, 't', "threads", "Number of worker threads to spawn");
+  print_opt(f, 'H', "header",
+            "Add Arbitrary header line, eg. 'Accept-Encoding: gzip'");
+  print_add_line(f, "Inserted after all normal header lines. (repeatable)");
+  print_opt(f, 'p', "postfile",
+            "File containing data to POST. Remember also to set -T");
+  print_opt(f, 'u', "putfile",
+            "File containing data to PUT. Remember also to set -T");
+  print_opt(f, 'T', "content-type",
+            "Content-type header to use for POST/PUT data, eg.");
+  print_add_line(f, "'application/x-www-form-urlencoded'");
+  print_add_line(f, "Default is 'text/plain'");
+  print_flag(f, 'i', "Use HEAD instead of GET");
+  print_flag(f, 'k', "Use HTTP KeepAlive feature (default)");
+  print_flag(f, 'K', "Disable HTTP KeepAlive feature");
+  print_opt(f, 'm', "method", "Method name");
+  print_flag(f, 'h', "Display usage information(this message)");
 }
 
 int main(int argc, char **argv) {
@@ -427,13 +446,41 @@ int main(int argc, char **argv) {
 
   global_ctx_defaults(&s_global);
 
+  char *method = "GET";
+  char *host = NULL;
+  char *port = NULL;
+  char *path = NULL;
+  char *user_agent = DEFAULT_USER_AGENT;
+  uv_buf_t headers = uv_buf_init(NULL, 0);
+  uv_buf_t body = uv_buf_init(NULL, 0);
+
   int c;
   opterr = 0;
-  while ((c = getopt(argc, argv, "hkKn:c:t:")) != -1) {
+  while ((c = getopt(argc, argv, "hH:m:p:u:T:kKin:c:t:")) != -1) {
     switch (c) {
     case 'h':
       print_help(stdout, argc, argv, NULL);
       return EXIT_SUCCESS;
+    case 'H':
+      uv_buf_xcat(&headers, "%s\r\n", optarg);
+      break;
+    case 'm':
+      method = optarg;
+      break;
+    case 'p':
+      method = "POST";
+      uv_buf_catfile(&body, optarg);
+      break;
+    case 'u':
+      method = "PUT";
+      uv_buf_catfile(&body, optarg);
+      break;
+    case 'T':
+      uv_buf_xcat(&headers, "Content-Type: %s\r\n", optarg);
+      break;
+    case 'i':
+      method = "HEAD";
+      break;
     case 'k':
       s_global.keep_alive = 1;
       break;
@@ -462,13 +509,14 @@ int main(int argc, char **argv) {
     return EXIT_FAILURE;
   }
 
-  s_global.url = argv[argc - 1];
-  if (parse_url(s_global.url) < 0) {
-    fprintf(stderr, "Unable to parse url %s.\n", s_global.url);
+  char *url = argv[argc - 1];
+  if (parse_url(url, &host, &port, &path) < 0) {
+    fprintf(stderr, "Unable to parse url %s.\n", url);
     return EXIT_FAILURE;
   }
 
-  prepare_http_request();
+  s_global.http_req = build_http_request(method, host, path, user_agent,
+                                         s_global.keep_alive, headers, body);
 
   uv_loop_t *loop = uv_default_loop();
 
@@ -479,12 +527,11 @@ int main(int argc, char **argv) {
   hints.ai_flags = 0;
 
   uv_getaddrinfo_t resolver;
-  int rc = uv_getaddrinfo(loop, &resolver, on_resolved, s_global.host,
-                          s_global.port, &hints);
+  int rc = uv_getaddrinfo(loop, &resolver, on_resolved, host, port, &hints);
   if (rc < 0) {
-    fprintf(stderr, "Unable to resolve %s: %s\n", s_global.host,
-            uv_err_name(rc));
+    fprintf(stderr, "Unable to resolve %s: %s\n", host, uv_err_name(rc));
     return EXIT_FAILURE;
   }
+
   return uv_run(loop, UV_RUN_DEFAULT);
 }
