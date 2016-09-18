@@ -10,19 +10,19 @@
 #endif
 
 #if defined(__unix__)
-#include <time.h>
 #include <sys/time.h>
+#include <time.h>
 #endif
 
 struct stopwatch_s {
 #if defined(_WIN32)
-    LARGE_INTEGER freq;
-    LARGE_INTEGER start;
-    LARGE_INTEGER end;
+  LARGE_INTEGER freq;
+  LARGE_INTEGER start;
+  LARGE_INTEGER end;
 #elif defined(__MACH__)
-    mach_timespec_t ts_start;
+  mach_timespec_t ts_start;
 #elif defined(__unix__)
-    struct timespec ts_start;
+  struct timespec ts_start;
 #else
 #error Unsupported platform
 #endif
