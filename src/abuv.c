@@ -520,7 +520,7 @@ int main(int argc, char **argv) {
 
   uv_loop_t *loop = uv_default_loop();
 
-  struct addrinfo hints;
+  struct addrinfo hints = {0};
   hints.ai_family = PF_INET;
   hints.ai_socktype = SOCK_STREAM;
   hints.ai_protocol = IPPROTO_TCP;
